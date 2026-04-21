@@ -97,9 +97,27 @@ type PendingEntry = {
   replies: number
 }
 
+/**
+ * Optional bot-allowlist rules. Missing / unset means "no bots accepted"
+ * (matches the pre-bot-allowlist behavior — self-loop guard is separate
+ * and always on).
+ *
+ *  - `allowAll: true` — every bot message is eligible (still subject to
+ *    the rest of the gate: channel must be configured, requireMention,
+ *    dmPolicy !== 'disabled', etc.)
+ *  - `allow: ["123…", "456…"]` — only these bot user IDs are eligible.
+ *  - Both present: allowAll wins.
+ */
+type BotPolicy = {
+  allowAll?: boolean
+  allow?: string[]
+}
+
 type GroupPolicy = {
   requireMention: boolean
   allowFrom: string[]
+  /** Per-channel bot allowlist. Scoped to this channel only. */
+  bots?: BotPolicy
 }
 
 type Access = {
@@ -109,6 +127,13 @@ type Access = {
   groups: Record<string, GroupPolicy>
   pending: Record<string, PendingEntry>
   mentionPatterns?: string[]
+  /**
+   * Server-wide bot allowlist applied to every configured channel.
+   * A bot allowed here still has to pass each channel's gate (channel
+   * must be in `groups`, mention requirement, dmPolicy !== 'disabled',
+   * etc.) — global only widens, never bypasses.
+   */
+  globalBots?: BotPolicy
   // delivery/UX config — optional, defaults live in the reply handler
   /** Emoji to react with on receipt. Empty string disables. Unicode char or custom emoji ID. */
   ackReaction?: string
@@ -158,6 +183,7 @@ function readAccessFile(): Access {
       groups: parsed.groups ?? {},
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
+      globalBots: parsed.globalBots,
       ackReaction: parsed.ackReaction,
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
@@ -190,6 +216,29 @@ const BOOT_ACCESS: Access | null = STATIC
 
 function loadAccess(): Access {
   return BOOT_ACCESS ?? readAccessFile()
+}
+
+/**
+ * Does this bot's user id fall under a configured bot allowlist for this
+ * channel? Global rules widen across all channels; per-group rules apply
+ * only to their own channel.
+ *
+ * This check is ONLY a bot-bypass for the `allowFrom` user-id filter.
+ * Callers must still enforce channel-existence, mention, and dmPolicy
+ * rules — a bot allowed here is NOT automatically allowed everywhere.
+ */
+function isBotAllowedForChannel(
+  access: Access,
+  channelId: string,
+  botId: string,
+): boolean {
+  const global = access.globalBots
+  if (global?.allowAll) return true
+  if (global?.allow?.includes(botId)) return true
+  const group = access.groups[channelId]?.bots
+  if (group?.allowAll) return true
+  if (group?.allow?.includes(botId)) return true
+  return false
 }
 
 function saveAccess(a: Access): void {
@@ -242,6 +291,11 @@ async function gate(msg: Message): Promise<GateResult> {
 
   const senderId = msg.author.id
   const isDM = msg.channel.type === ChannelType.DM
+  const isBot = msg.author.bot
+
+  // Bots can't DM other bots (Discord restriction), but be defensive:
+  // a bot message in a DM context is never valid input for this bridge.
+  if (isBot && isDM) return { action: 'drop' }
 
   if (isDM) {
     if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
@@ -284,7 +338,15 @@ async function gate(msg: Message): Promise<GateResult> {
   if (!policy) return { action: 'drop' }
   const groupAllowFrom = policy.allowFrom ?? []
   const requireMention = policy.requireMention ?? true
-  if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
+  if (isBot) {
+    // Bot senders bypass the user-id allowFrom check (those IDs are
+    // humans) but still must match a bot allowlist AND still owe the
+    // mention requirement. A channel not present in `groups` already
+    // dropped above, so "configured channel" is implicit here.
+    if (!isBotAllowedForChannel(access, channelId, senderId)) {
+      return { action: 'drop' }
+    }
+  } else if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
     return { action: 'drop' }
   }
   if (requireMention && !(await isMentioned(msg, access.mentionPatterns))) {
@@ -803,7 +865,11 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
-  if (msg.author.bot) return
+  // Self-loop guard — our own bot's messages never re-enter. This is
+  // non-negotiable and not controllable via access.json.
+  if (client.user && msg.author.id === client.user.id) return
+  // Other bots fall through to gate(), which enforces the configured
+  // bot allowlist (see `globalBots` / `groups[*].bots`).
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 

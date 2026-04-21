@@ -58,6 +58,56 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 /discord:access group rm 846209781206941736
 ```
 
+## Bot senders
+
+By default, messages from other bots are dropped before any gate. Turn them back on with an explicit allowlist — scoped per-channel, globally, or both. **The bot's own messages are always dropped regardless of config** (self-loop guard, not toggleable).
+
+A bot allowlist **widens** who may pass the sender check — it does not bypass the rest of the gate. An allowed bot still needs:
+
+- The channel to be in `groups` (bots never deliver from un-enabled channels).
+- `requireMention` satisfied if the channel has it on.
+- `dmPolicy !== "disabled"`.
+
+### Per-channel bots
+
+```jsonc
+"groups": {
+  "846209781206941736": {
+    "requireMention": false,
+    "allowFrom": [],
+    "bots": {
+      "allowAll": false,
+      "allow": ["1234567890123456789"]
+    }
+  }
+}
+```
+
+- `bots.allowAll: true` — every bot in that channel is eligible.
+- `bots.allow: [...]` — specific bot user IDs only.
+
+### Global bots
+
+```jsonc
+"globalBots": {
+  "allowAll": false,
+  "allow": ["1234567890123456789"]
+}
+```
+
+Same shape as `bots`, applied to every configured channel. Global only widens — it never bypasses per-channel gates.
+
+### Evaluation order (bots)
+
+For a bot-authored message, the gate accepts it when ANY of:
+
+1. `globalBots.allowAll === true`, or
+2. `msg.author.id ∈ globalBots.allow`, or
+3. `groups[channelId].bots.allowAll === true`, or
+4. `msg.author.id ∈ groups[channelId].bots.allow`.
+
+Otherwise the message is dropped. The `allowFrom` user-id list is not consulted for bots (bots aren't on the human allowlist).
+
 ## Mention detection
 
 In channels with `requireMention: true`, any of the following triggers the bot:
@@ -121,8 +171,21 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
       // true: respond only to @mentions and replies.
       "requireMention": true,
       // Restrict triggers to these senders. Empty = any member (subject to requireMention).
-      "allowFrom": []
+      "allowFrom": [],
+      // Optional per-channel bot allowlist (see "Bot senders" above).
+      // Omitted → no bots accepted in this channel.
+      "bots": {
+        "allowAll": false,
+        "allow": []
+      }
     }
+  },
+
+  // Server-wide bot allowlist (see "Bot senders" above). Still
+  // requires each channel to be in `groups`; global only widens.
+  "globalBots": {
+    "allowAll": false,
+    "allow": []
   },
 
   // Case-insensitive regexes that count as a mention.
